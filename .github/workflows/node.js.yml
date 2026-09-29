@@ -1,25 +1,363 @@
-name: Node.js CI
+name: 3-Tier DevSecOps Pipeline
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SONAR_PROJECT_NAME: NodeJS-Project
+  SONAR_PROJECT_KEY: NodeJS-Project
 
 jobs:
-  build:
 
-    runs-on: Agent-1
-
-  
+  # ============================================================
+  # 1. Frontend Compilation
+  # ============================================================
+  frontend-compilation:
+    name: Frontend Compilation
+    runs-on: sAgent-1
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Use Node.js ${{ matrix.node-version }}
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ matrix.node-version }}
-        cache: 'npm'
-    - run: npm ci
-    - run: npm run build --if-present
-    - run: npm test
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '23'
+
+      - name: Check Frontend JavaScript
+        working-directory: client
+        run: |
+          find . -name "*.js" -exec node --check {} +
+
+
+  # ============================================================
+  # 2. Backend Compilation
+  # ============================================================
+  backend-compilation:
+    name: Backend Compilation
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '23'
+
+      - name: Check Backend JavaScript
+        working-directory: api
+        run: |
+          find . -name "*.js" -exec node --check {} +
+
+
+  # ============================================================
+  # 3. Security Scans + SonarQube
+  # ============================================================
+  security-scan:
+    name: Gitleaks + SonarQube + Trivy FS
+    runs-on: self-hosted
+    needs:
+      - frontend-compilation
+      - backend-compilation
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # ---------------- Gitleaks ----------------
+
+      - name: Install Gitleaks
+        run: |
+          if ! command -v gitleaks >/dev/null 2>&1; then
+            echo "Gitleaks is not installed on runner"
+            exit 1
+          fi
+
+      - name: Gitleaks - Client
+        run: |
+          gitleaks detect \
+            --source ./client \
+            --exit-code 1
+
+      - name: Gitleaks - API
+        run: |
+          gitleaks detect \
+            --source ./api \
+            --exit-code 1
+
+      # ---------------- SonarQube ----------------
+
+      - name: SonarQube Scan
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          sonar-scanner \
+            -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
+            -Dsonar.projectKey="${SONAR_PROJECT_KEY}" \
+            -Dsonar.sources=.
+
+      # ---------------- Quality Gate ----------------
+
+      - name: SonarQube Quality Gate
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          echo "Waiting for SonarQube Quality Gate..."
+
+          sleep 20
+
+          STATUS=$(curl -s \
+            -u "${SONAR_TOKEN}:" \
+            "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}" \
+            | jq -r '.projectStatus.status')
+
+          echo "Quality Gate Status: $STATUS"
+
+          if [ "$STATUS" != "OK" ]; then
+            echo "Quality Gate failed"
+            exit 1
+          fi
+
+      # ---------------- Trivy ----------------
+
+      - name: Trivy Filesystem Scan
+        run: |
+          trivy fs \
+            --format table \
+            -o fs-report.html \
+            .
+
+      - name: Upload Trivy FS Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-fs-report
+          path: fs-report.html
+
+
+  # ============================================================
+  # 4. Backend Docker Build + Scan + Push
+  # ============================================================
+  backend-docker:
+    name: Build Push Backend Image
+    runs-on: self-hosted
+    needs: security-scan
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build Backend Image
+        working-directory: api
+        run: |
+          docker build \
+            -t ${{ secrets.DOCKER_USERNAME }}/backend:latest \
+            .
+
+      - name: Trivy Backend Image Scan
+        run: |
+          trivy image \
+            --format table \
+            -o backend-image-report.html \
+            ${{ secrets.DOCKER_USERNAME }}/backend:latest
+
+      - name: Upload Backend Trivy Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-image-report
+          path: api/backend-image-report.html
+          if-no-files-found: ignore
+
+      - name: Push Backend Image
+        run: |
+          docker push \
+            ${{ secrets.DOCKER_USERNAME }}/backend:latest
+
+
+  # ============================================================
+  # 5. Frontend Docker Build + Scan + Push
+  # ============================================================
+  frontend-docker:
+    name: Build Push Frontend Image
+    runs-on: self-hosted
+    needs: security-scan
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build Frontend Image
+        working-directory: client
+        run: |
+          docker build \
+            -t ${{ secrets.DOCKER_USERNAME }}/frontend:latest \
+            .
+
+      - name: Trivy Frontend Image Scan
+        run: |
+          trivy image \
+            --format table \
+            -o frontend-image-report.html \
+            ${{ secrets.DOCKER_USERNAME }}/frontend:latest
+
+      - name: Upload Frontend Trivy Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-image-report
+          path: client/frontend-image-report.html
+          if-no-files-found: ignore
+
+      - name: Push Frontend Image
+        run: |
+          docker push \
+            ${{ secrets.DOCKER_USERNAME }}/frontend:latest
+
+
+  # ============================================================
+  # 6. Production Approval
+  # ============================================================
+  production-approval:
+    name: Production Approval
+    runs-on: self-hosted
+    needs:
+      - backend-docker
+      - frontend-docker
+
+    environment:
+      name: production
+
+    steps:
+      - name: Production Approved
+        run: |
+          echo "Production deployment approved"
+
+
+  # ============================================================
+  # 7. Deploy to EKS
+  # ============================================================
+  deploy-production:
+    name: Deploy to Production EKS
+    runs-on: self-hosted
+    needs: production-approval
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ap-south-1 \
+            --name devopsshack-cluster
+
+      - name: Verify Kubernetes Access
+        run: |
+          kubectl get nodes
+
+      - name: Apply Secret Configuration
+        run: |
+          kubectl apply -f k8s-prod/sc.yaml
+
+      - name: Wait
+        run: |
+          sleep 20
+
+      - name: Deploy MySQL
+        run: |
+          kubectl apply \
+            -f k8s-prod/mysql.yaml \
+            -n prod
+
+      - name: Deploy Backend
+        run: |
+          kubectl apply \
+            -f k8s-prod/backend.yaml \
+            -n prod
+
+      - name: Deploy Frontend
+        run: |
+          kubectl apply \
+            -f k8s-prod/frontend.yaml \
+            -n prod
+
+      - name: Deploy CI Configuration
+        run: |
+          kubectl apply \
+            -f k8s-prod/ci.yaml
+
+      - name: Deploy Ingress
+        run: |
+          kubectl apply \
+            -f k8s-prod/ingress.yaml \
+            -n prod
+
+      - name: Wait for Deployment
+        run: |
+          sleep 30
+
+
+  # ============================================================
+  # 8. Verify Production Deployment
+  # ============================================================
+  verify-production:
+    name: Verify Production
+    runs-on: self-hosted
+    needs: deploy-production
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ap-south-1 \
+            --name devopsshack-cluster
+
+      - name: Get Production Pods
+        run: |
+          kubectl get pods -n prod
+
+      - name: Wait
+        run: |
+          sleep 20
+
+      - name: Get Production Ingress
+        run: |
+          kubectl get ingress -n prod
